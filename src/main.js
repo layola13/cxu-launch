@@ -65,7 +65,11 @@ $("btnStart").onclick = () => run(() => invoke("launcher_start"), "正在启动 
 $("btnRestart").onclick = () => run(() => invoke("launcher_restart"), "正在重启服务…");
 $("btnInstall").onclick = () => run(() => invoke("launcher_install"), "正在安装 cxu（npm + doctor）…");
 $("btnUpdate").onclick = () => run(() => invoke("launcher_update"), "正在更新 cxu…");
-$("btnOpen").onclick = () => invoke("launcher_open_ui");
+$("btnOpen").onclick = () => {
+  invoke("launcher_open_ui")
+    .then(() => log("已调用系统浏览器打开工作台。"))
+    .catch((e) => log(`打开工作台失败: ${String(e)}`));
+};
 $("btnLogDir").onclick = () => invoke("launcher_open_log_dir");
 $("btnHide").onclick = () => invoke("launcher_hide");
 // 退出后进程直接结束，不再 refresh（否则只会刷出一行失败日志）。

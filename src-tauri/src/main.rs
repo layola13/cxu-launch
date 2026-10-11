@@ -256,22 +256,25 @@ fn any_port_open() -> bool {
 
 // 统一服务状态：优先认自己的子进程；否则探测外部健康端口并接管（pid=None 表示外部进程）。
 fn current_service(state: &Mutex<LauncherState>) -> (bool, Option<u32>, u16) {
-  let (own_running, own_pid) = child_alive(state);
-  if own_running {
-    let port = state.lock().unwrap().port;
-    return (true, own_pid, port);
+  // 快路径：上次端口还健康就直接认（一次 TCP，毫秒级），避免每次全量扫 21 个端口。
+  let port = state.lock().unwrap().port;
+  if health_ok(port) {
+    let (_, pid) = child_alive(state);
+    return (true, pid, port);
+  }
+  // 慢路径：上次端口挂了。自己的子进程还在就认它（启动中，健康还没就绪）；
+  // 否则全量扫一次找外部复用目标。
+  {
+    let (own_running, own_pid) = child_alive(state);
+    if own_running {
+      return (true, own_pid, port);
+    }
   }
   if let Some(p) = probe_healthy_port() {
     state.lock().unwrap().port = p;
     return (true, None, p);
   }
-  let port = state.lock().unwrap().port;
   (false, None, port)
-}
-
-fn resolve_open_url(state: &Mutex<LauncherState>) -> Option<String> {
-  let (running, _, port) = current_service(state);
-  running.then(|| format!("http://{HOST}:{port}"))
 }
 
 #[tauri::command]
@@ -405,9 +408,17 @@ async fn launcher_update(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-async fn launcher_open_ui(state: State<'_, Mutex<LauncherState>>) -> Result<(), String> {
-  let url = resolve_open_url(&state).ok_or("服务未运行，请先启动服务。")?;
-  tauri_plugin_opener::open_url(url, None::<&str>).map_err(|e| e.to_string())?;
+fn launcher_open_ui(app: AppHandle, state: State<'_, Mutex<LauncherState>>) -> Result<(), String> {
+  // 点击即返回：只读上次已知端口（由轮询 + 启动时维护），绝不在点击路径上做全端口扫描；
+  // 浏览器拉起丢独立线程 fire-and-forget，任何情况下都不卡 IPC、不卡窗口。
+  let port = state.lock().unwrap().port;
+  let url = format!("http://{HOST}:{port}");
+  emit_log(&app, &format!("正在系统浏览器打开工作台 {url}"));
+  std::thread::spawn(move || {
+    if let Err(e) = tauri_plugin_opener::open_url(url, None::<&str>) {
+      try_append_log(&format!("打开浏览器失败: {e}"));
+    }
+  });
   Ok(())
 }
 
@@ -532,9 +543,14 @@ fn main() {
           "open" => show_main(app),
           "open_ui" => {
             let st: State<'_, Mutex<LauncherState>> = app.state();
-            if let Some(url) = resolve_open_url(&st) {
-              let _ = tauri_plugin_opener::open_url(url, None::<&str>);
-            }
+            let port = st.lock().unwrap().port;
+            let url = format!("http://{HOST}:{port}");
+            try_append_log(&format!("正在系统浏览器打开工作台 {url}"));
+            std::thread::spawn(move || {
+              if let Err(e) = tauri_plugin_opener::open_url(url, None::<&str>) {
+                try_append_log(&format!("打开浏览器失败: {e}"));
+              }
+            });
           }
           "restart" => {
             let h = app.clone();
