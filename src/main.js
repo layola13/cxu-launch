@@ -51,12 +51,22 @@ async function refresh() {
 }
 
 async function run(fn, busyText) {
+  // 操作期间锁住动作按钮：后端 launcher_start 最长跑 20s，没有反馈用户就会连点。
+  if (window.__launcherBusy) {
+    log("已有操作在进行，请稍候…");
+    return;
+  }
+  window.__launcherBusy = true;
+  for (const id of ["btnStart", "btnRestart", "btnInstall", "btnUpdate"]) {
+    $(id).disabled = true;
+  }
   try {
     $("subtitle").textContent = busyText;
     await fn();
   } catch (e) {
     log(`失败: ${String(e)}`);
   } finally {
+    window.__launcherBusy = false;
     await refresh();
   }
 }

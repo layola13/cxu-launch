@@ -152,7 +152,18 @@ fn try_append_log(line: &str) {
   if std::fs::create_dir_all(&dir).is_err() {
     return;
   }
-  let mut f = match std::fs::OpenOptions::new().create(true).append(true).open(dir.join("launcher.log")) {
+  let path = dir.join("launcher.log");
+  // 日志轮转：超过 512KB 就只保留最后约 128KB，避免常驻后台把文件养到上百 MB。
+  if let Ok(meta) = std::fs::metadata(&path) {
+    if meta.len() > 512 * 1024 {
+      if let Ok(text) = std::fs::read(&path) {
+        let keep = text.len().saturating_sub(128 * 1024);
+        let start = text[keep..].iter().position(|&b| b == b'\n').map(|i| keep + i + 1).unwrap_or(keep);
+        let _ = std::fs::write(&path, &text[start..]);
+      }
+    }
+  }
+  let mut f = match std::fs::OpenOptions::new().create(true).append(true).open(&path) {
     Ok(f) => f,
     Err(_) => return,
   };
@@ -209,7 +220,11 @@ fn cxu_version(path: &str) -> Option<String> {
   if text.is_empty() {
     None
   } else {
-    Some(text.replace("cxu v", "").replace('v', "").trim().to_string())
+    // 只剥掉 "cxu v" / 首字母 v 前缀。旧代码 .replace('v',"") 会删掉版本号里所有的 v。
+    let t = text.strip_prefix("cxu v").or_else(|| text.strip_prefix("cxu ")).unwrap_or(&text);
+    let t = t.strip_prefix('v').unwrap_or(t);
+    let t = t.trim();
+    if t.is_empty() { None } else { Some(t.to_string()) }
   }
 }
 
@@ -414,41 +429,82 @@ async fn launcher_start(
   emit_log(&app, &format!("启动 cxu: {path} serve --port {port}"));
   let _ = std::fs::create_dir_all(log_dir());
   let log_path = log_dir().join("cxu-serve.log");
-  let log_file = std::fs::File::create(&log_path).map_err(|e| {
-    done(&state);
-    e.to_string()
-  })?;
-  let err_file = log_file.try_clone().map_err(|e| {
-    done(&state);
-    e.to_string()
-  })?;
-  let child = spawn_cxu_serve(&path, port, log_file, err_file).map_err(|e| {
-    done(&state);
-    format!("启动失败（spawn {path} 出错）: {e}，请看 cxu-serve.log。")
-  })?;
-  state.lock().unwrap().child = Some(child);
-  // 等待就绪：每 500ms 探一次，共 20s；每 2s 打一行进度，前端轮询能看到活着。
-  for i in 0..40 {
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    let (alive, _) = child_alive(&state);
-    if !alive {
-      done(&state);
-      return Err("cxu 进程已退出，请看 cxu-serve.log。".into());
+  // 端口竞态重试：pick_port 选中到 serve 实际监听之间端口可能被抢，
+  // 旧代码直接报“进程已退出”。改为最多顺延试 3 个端口。
+  let mut last_err = String::new();
+  for attempt in 0..3 {
+    let try_port = port + attempt;
+    if attempt > 0 {
+      // 顺延的端口必须当前可 bind，否则跳过。
+      if std::net::TcpListener::bind((HOST, try_port)).is_err() {
+        continue;
+      }
+      state.lock().unwrap().port = try_port;
+      emit_log(&app, &format!("端口 {port} 被占用，改试 {try_port}"));
     }
-    if health_ok(port) {
-      svc.inner.lock().unwrap().clone_from(&(true, child_alive_pid(&state), port));
-      state.lock().unwrap().port = port;
+    let log_file = match std::fs::File::create(&log_path) {
+      Ok(f) => f,
+      Err(e) => {
+        done(&state);
+        return Err(e.to_string());
+      }
+    };
+    let err_file = match log_file.try_clone() {
+      Ok(f) => f,
+      Err(e) => {
+        done(&state);
+        return Err(e.to_string());
+      }
+    };
+    let child = match spawn_cxu_serve(&path, try_port, log_file, err_file) {
+      Ok(c) => c,
+      Err(e) => {
+        last_err = format!("启动失败（spawn {path} 出错）: {e}，请看 cxu-serve.log。");
+        continue;
+      }
+    };
+    state.lock().unwrap().child = Some(child);
+    // 等待就绪：每 500ms 探一次，共 20s；每 2s 打一行进度，前端轮询能看到活着。
+    let mut ready = false;
+    for i in 0..40 {
+      tokio::time::sleep(Duration::from_millis(500)).await;
+      let (alive, _) = child_alive(&state);
+      if !alive {
+        last_err = "cxu 进程已退出（端口可能被抢占），请看 cxu-serve.log。".to_string();
+        break;
+      }
+      if health_ok(try_port) {
+        ready = true;
+        break;
+      }
+      if i % 4 == 3 {
+        emit_log(&app, &format!("等待服务就绪…（{}s）", (i + 1) / 2));
+      }
+    }
+    if ready {
+      svc.inner.lock().unwrap().clone_from(&(true, child_alive_pid(&state), try_port));
+      state.lock().unwrap().port = try_port;
       done(&state);
-      let url = format!("http://{HOST}:{port}");
+      let url = format!("http://{HOST}:{try_port}");
       emit_log(&app, &format!("服务就绪 {url}"));
       return Ok(url);
     }
-    if i % 4 == 3 {
-      emit_log(&app, &format!("等待服务就绪…（{}s）", (i + 1) / 2));
+    // 本轮没就绪（进程已退出）：继续试下一个端口；进程还在但 20s 未就绪则直接超时。
+    {
+      let guard = state.lock().unwrap();
+      if guard.child.is_some() {
+        drop(guard);
+        done(&state);
+        return Err("服务启动超时（20s），请看 cxu-serve.log。".into());
+      }
     }
   }
   done(&state);
-  Err("服务启动超时（20s），请看 cxu-serve.log。".into())
+  Err(if last_err.is_empty() {
+    "服务启动失败，请看 cxu-serve.log。".to_string()
+  } else {
+    last_err
+  })
 }
 
 // 只读 pid，不收割 child（status 快照/日志用）。
@@ -467,17 +523,21 @@ fn child_alive_pid(state: &Mutex<LauncherState>) -> Option<u32> {
 
 #[tauri::command]
 fn launcher_stop(state: State<'_, Mutex<LauncherState>>, svc: State<'_, ServiceCache>) -> Result<(), String> {
-  let port = {
+  {
     let mut guard = state.lock().unwrap();
     if let Some(mut child) = guard.child.take() {
       let _ = child.kill();
       let _ = child.wait();
     }
     guard.starting = false;
-    guard.port
+  }
+  // 杀完立即按真实情况重算一次快照（而不是硬写 stopped）：
+  // 无外部服务 → stopped；有外部服务 → 保持 running，不闪烁。
+  let snap = {
+    let st: &Mutex<LauncherState> = &state;
+    current_service(st)
   };
-  // 立即把快照置为停止，UI 秒变；监控线程 2s 内会复核（若有外部服务会重新置为运行）。
-  *svc.inner.lock().unwrap() = (false, None, port);
+  *svc.inner.lock().unwrap() = snap;
   Ok(())
 }
 
@@ -496,6 +556,15 @@ async fn launcher_restart(
     if let Some(mut child) = guard.child.take() {
       let _ = child.kill();
       let _ = child.wait();
+    } else {
+      // 没有本启动器拉起的子进程：如果快照里有外部服务在跑，诚实拒绝，
+      // 别演“重启成功”——启动器杀不掉外部进程，重启只会空转复用回来。
+      let (running, _, port) = svc.inner.lock().unwrap().clone();
+      if running && health_ok(port) {
+        return Err(format!(
+          "当前运行的是外部 cxu 服务（端口 {port}），启动器无法重启它：请先停掉外部服务，或直接用它。"
+        ));
+      }
     }
   }
   tokio::time::sleep(Duration::from_millis(500)).await;
