@@ -1,6 +1,6 @@
 {
   "name": "cxu-launch",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "description": "Codex Ultra minimal desktop launcher (Tauri 2 + WebView2, no embedded browser/backend)",
   "type": "module",
