@@ -70,11 +70,20 @@ npm run build:mac
 Linux 前置：`libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev` 等；
 macOS 要求 10.15+，Windows 仍用 NSIS。
 
-Release 流程：打 tag `v*` 即触发三平台构建并发布 GitHub Release：
+Release 流程：打 tag `v*` 即触发 6 任务矩阵构建（x64 + ARM 三平台同一 Release）：
 
 ```bash
 git tag v0.2.0 && git push origin v0.2.0
 ```
+
+| # | Runner | Target | 产物 |
+|---|--------|--------|------|
+| win x64 | windows-latest | 原生 | NSIS `*_x64-setup.exe` |
+| win ARM64 | windows-latest | `aarch64-pc-windows-msvc` 交叉 | NSIS `*_arm64-setup.exe` |
+| linux x64 | ubuntu-22.04 | 原生 | `*.deb` + `*.AppImage` |
+| linux ARM64 | ubuntu-24.04-arm | 原生 ARM runner | `*.deb` + `*.AppImage` |
+| mac ARM64 | macos-latest | `aarch64-apple-darwin` | `*_aarch64.dmg` + `.app` |
+| mac Intel | macos-latest | `x86_64-apple-darwin` 交叉 | `*_x64.dmg` + `.app` |
 
 ## 行为契约（与老 Electron 壳对齐）
 
