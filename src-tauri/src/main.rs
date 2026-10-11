@@ -109,7 +109,22 @@ fn log_dir() -> PathBuf {
   if cfg!(windows) {
     let base = std::env::var("APPDATA").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(base).join("cxu-launch").join("logs")
+  } else if cfg!(target_os = "macos") {
+    // macOS: ~/Library/Logs/cxu-launch (与系统日志约定一致)
+    if let Some(home) = home_dir_fallback() {
+      return home.join("Library").join("Logs").join("cxu-launch");
+    }
+    PathBuf::from(".").join("logs")
   } else {
+    // Linux: $XDG_DATA_HOME/cxu-launch/logs, fallback ~/.local/share/cxu-launch/logs
+    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+      if !xdg.is_empty() {
+        return PathBuf::from(xdg).join("cxu-launch").join("logs");
+      }
+    }
+    if let Some(home) = home_dir_fallback() {
+      return home.join(".local").join("share").join("cxu-launch").join("logs");
+    }
     PathBuf::from(".").join("logs")
   }
 }

@@ -1,6 +1,6 @@
 {
   "name": "cxu-launch",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "Codex Ultra minimal desktop launcher (Tauri 2 + WebView2, no embedded browser/backend)",
   "type": "module",
@@ -8,14 +8,16 @@
     "tauri": "tauri",
     "dev": "tauri dev",
     "build": "tauri build",
-    "build:nsis": "tauri build --bundles nsis"
+    "build:nsis": "tauri build --bundles nsis",
+    "build:linux": "tauri build --bundles deb,appimage",
+    "build:mac": "tauri build --bundles dmg,app",
+    "build:all": "tauri build"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.2.0"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.2.0",
-    "@tauri-apps/plugin-opener": "^2.2.0",
-    "codex-react-ui": "file:../codex-ultra"
+    "@tauri-apps/plugin-opener": "^2.2.0"
   }
 }
