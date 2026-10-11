@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Launcher needs shell-spawn via Rust only; frontend may call launcher_* commands and open log dir.","local":true,"windows":["main"],"permissions":["core:event:allow-listen","core:event:allow-emit","core:window:allow-close","core:window:allow-hide","core:window:allow-show","opener:allow-open-url","opener:allow-open-path"]}}

@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>cxu 启动器</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <main>
+    <header>
+      <div class="logo">CXU</div>
+      <div>
+        <h1>Codex Ultra 启动器</h1>
+        <p id="subtitle">正在检测本地服务…</p>
+      </div>
+      <span id="dot" class="dot idle" title="状态"></span>
+    </header>
+
+    <section class="card">
+      <div class="row"><span>本机 cxu</span><code id="localVer">检测中…</code></div>
+      <div class="row"><span>最新版本</span><code id="remoteVer">—</code></div>
+      <div class="row"><span>服务地址</span><code id="serveUrl">—</code></div>
+      <div class="row"><span>服务状态</span><code id="serveState">stopped</code></div>
+    </section>
+
+    <section class="actions">
+      <button id="btnStart" disabled>启动服务</button>
+      <button id="btnOpen" disabled>打开工作台</button>
+      <button id="btnUpdate" disabled>更新 cxu</button>
+      <button id="btnInstall" disabled>安装 cxu</button>
+      <button id="btnRestart" disabled>重启服务</button>
+    </section>
+
+    <section class="card">
+      <div class="row between">
+        <span>运行日志</span>
+        <span>
+          <button id="btnLogDir" class="mini">日志目录</button>
+          <button id="btnHide" class="mini">隐藏到托盘</button>
+        </span>
+      </div>
+      <pre id="log">启动器就绪。</pre>
+    </section>
+
+    <footer>关闭窗口仅隐藏到托盘。<button id="btnQuit" class="mini">退出启动器</button></footer>
+  </main>
+  <script type="module" src="./main.js"></script>
+  <script>
+    // 启动兜底：如果 module 因任何原因没跑起来，4s 后把真相写进日志，而不是静默卡死。
+    setTimeout(function () {
+      if (!window.__launcherBooted) {
+        var el = document.getElementById("log");
+        if (el) el.textContent += "\n[错误] 前端未能启动（JS 未执行），请打开 DevTools 看 Console 并截图反馈。";
+        var st = document.getElementById("subtitle");
+        if (st) st.textContent = "前端启动失败，请查看运行日志。";
+      }
+    }, 4000);
+  </script>
+</body>
+</html>
