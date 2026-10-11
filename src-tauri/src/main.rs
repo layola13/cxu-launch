@@ -19,11 +19,24 @@ const HOST: &str = "127.0.0.1";
 struct LauncherState {
   child: Option<Child>,
   port: u16,
+  starting: bool,
 }
 
 impl Default for LauncherState {
   fn default() -> Self {
-    Self { child: None, port: PREFERRED_PORT }
+    Self { child: None, port: PREFERRED_PORT, starting: false }
+  }
+}
+
+// 服务状态快照：由后台监控线程每 ~2s 刷新一次。
+// launcher_status / launcher_open_ui 只读快照、零 I/O —— 永远不会卡死。
+struct ServiceCache {
+  inner: Mutex<(bool, Option<u32>, u16)>,
+}
+
+impl Default for ServiceCache {
+  fn default() -> Self {
+    Self { inner: Mutex::new((false, None, PREFERRED_PORT)) }
   }
 }
 
@@ -200,6 +213,19 @@ fn cxu_version(path: &str) -> Option<String> {
   }
 }
 
+// 健康探测超时：必须小。旧值 connect 800ms + read 1500ms，21 个端口串行扫一遍
+// 无服务时要十几秒 —— 这就是启动/轮询卡死的直接原因。
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_millis(150);
+const TCP_READ_TIMEOUT: Duration = Duration::from_millis(350);
+
+fn tcp_open(port: u16) -> bool {
+  let addr: std::net::SocketAddr = match format!("{HOST}:{port}").parse() {
+    Ok(a) => a,
+    Err(_) => return false,
+  };
+  std::net::TcpStream::connect_timeout(&addr, TCP_CONNECT_TIMEOUT).is_ok()
+}
+
 fn pick_port() -> u16 {
   for p in PREFERRED_PORT..=(PREFERRED_PORT + 20) {
     if std::net::TcpListener::bind((HOST, p)).is_ok() {
@@ -215,22 +241,37 @@ fn health_ok(port: u16) -> bool {
     Ok(a) => a,
     Err(_) => return false,
   };
-  let Ok(mut s) = TcpStream::connect_timeout(&parsed, Duration::from_millis(800)) else {
+  let Ok(mut s) = TcpStream::connect_timeout(&parsed, TCP_CONNECT_TIMEOUT) else {
     return false;
   };
-  let _ = s.set_read_timeout(Some(Duration::from_millis(1500)));
+  let _ = s.set_read_timeout(Some(TCP_READ_TIMEOUT));
   let req = "GET /api/runtime/health HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
   if s.write_all(req.as_bytes()).is_err() {
     return false;
   }
+  // 状态行一定在前几百字节内；最多读几次、读到含 \r\n 就判，避免一次短读误判。
+  let mut head = Vec::with_capacity(1024);
   let mut buf = [0u8; 512];
-  match s.read(&mut buf) {
-    Ok(n) => {
-      let head = String::from_utf8_lossy(&buf[..n]);
-      head.contains("200") || head.contains("404") || head.contains("401")
+  for _ in 0..4 {
+    match s.read(&mut buf) {
+      Ok(0) => break,
+      Ok(n) => {
+        head.extend_from_slice(&buf[..n]);
+        if head.windows(2).any(|w| w == b"\r\n") {
+          break;
+        }
+        if head.len() >= 1024 {
+          break;
+        }
+      }
+      Err(_) => break,
     }
-    Err(_) => false,
   }
+  if head.is_empty() {
+    return false;
+  }
+  let text = String::from_utf8_lossy(&head);
+  text.contains("200") || text.contains("404") || text.contains("401")
 }
 
 fn child_alive(state: &Mutex<LauncherState>) -> (bool, Option<u32>) {
@@ -247,8 +288,12 @@ fn child_alive(state: &Mutex<LauncherState>) -> (bool, Option<u32>) {
 }
 
 // 扫描 43110 起 21 个端口，复用任何已在运行的健康服务（含外部手动启动 / 上次残留进程）。
+// 两段式：先 150ms 快探端口是否 open，只有 open 的才发 HTTP —— 关闭端口不再吃 800ms+。
 fn probe_healthy_port() -> Option<u16> {
   for p in PREFERRED_PORT..=(PREFERRED_PORT + 20) {
+    if !tcp_open(p) {
+      continue;
+    }
     if health_ok(p) {
       return Some(p);
     }
@@ -256,20 +301,6 @@ fn probe_healthy_port() -> Option<u16> {
   None
 }
 
-fn any_port_open() -> bool {
-  for p in PREFERRED_PORT..=(PREFERRED_PORT + 20) {
-    let addr: std::net::SocketAddr = match format!("{HOST}:{p}").parse() {
-      Ok(a) => a,
-      Err(_) => continue,
-    };
-    if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
-      return true;
-    }
-  }
-  false
-}
-
-// 统一服务状态：优先认自己的子进程；否则探测外部健康端口并接管（pid=None 表示外部进程）。
 fn current_service(state: &Mutex<LauncherState>) -> (bool, Option<u32>, u16) {
   // 快路径：上次端口还健康就直接认（一次 TCP，毫秒级），避免每次全量扫 21 个端口。
   let port = state.lock().unwrap().port;
@@ -292,16 +323,37 @@ fn current_service(state: &Mutex<LauncherState>) -> (bool, Option<u32>, u16) {
   (false, None, port)
 }
 
+// Windows 上直接 spawn *.cmd / 无扩展名脚本会失败（CreateProcess 跑不了批处理），
+// 之前 find_cxu 返回的第一个结果经常是这类路径 —— 点击启动就静默失败。
+// 统一走这个 helper：脚本类包一层 cmd /C，可执行文件直接起，且一律无黑框。
+fn spawn_cxu_serve(path: &str, port: u16, log_file: std::fs::File, err_file: std::fs::File) -> std::io::Result<Child> {
+  let lower = path.to_lowercase();
+  let is_script = lower.ends_with(".cmd") || lower.ends_with(".bat") || lower.ends_with(".ps1");
+  let has_exe_ext = lower.ends_with(".exe");
+  let needs_shell = is_script || !has_exe_ext;
+  if needs_shell {
+    let mut cmd = silent_cmd("cmd");
+    cmd.args(["/C", path, "serve", "--port", &port.to_string()]);
+    cmd.stdout(Stdio::from(log_file)).stderr(Stdio::from(err_file)).stdin(Stdio::null());
+    cmd.spawn()
+  } else {
+    let mut cmd = silent_cmd(path);
+    cmd.args(["serve", "--port", &port.to_string()]);
+    cmd.stdout(Stdio::from(log_file)).stderr(Stdio::from(err_file)).stdin(Stdio::null());
+    cmd.spawn()
+  }
+}
+
 #[tauri::command]
 fn launcher_status(
-  state: State<'_, Mutex<LauncherState>>,
   cache: State<'_, LatestCache>,
   cxu: State<'_, CxuCache>,
+  svc: State<'_, ServiceCache>,
 ) -> LauncherStatus {
-  // 热路径：只读缓存 + 纯 socket 探测，不拉任何子进程（无黑框、无卡顿）。
-  // cxu 定位/版本由后台线程慢刷；安装/更新成功后会立即刷新缓存。
+  // 热路径：只读缓存、零 I/O —— 永远不会卡死。
+  // 服务快照由后台监控线程每 ~2s 刷新；cxu 定位/版本由后台慢刷。
   let (path, ver) = cxu.inner.lock().unwrap().clone();
-  let (running, pid, port) = current_service(&state);
+  let (running, pid, port) = svc.inner.lock().unwrap().clone();
   LauncherStatus {
     cxu_path: path,
     cxu_version: ver,
@@ -314,27 +366,45 @@ fn launcher_status(
 }
 
 #[tauri::command]
-async fn launcher_start(app: AppHandle, state: State<'_, Mutex<LauncherState>>) -> Result<String, String> {
-  let path = find_cxu().ok_or("未找到 cxu，请先安装。")?;
+async fn launcher_start(
+  app: AppHandle,
+  state: State<'_, Mutex<LauncherState>>,
+  cxu: State<'_, CxuCache>,
+  svc: State<'_, ServiceCache>,
+) -> Result<String, String> {
+  // 防重入：上一次启动还在跑时直接拒绝，避免并发 probe 叠加把机器拖死。
   {
-    let (running, _) = child_alive(&state);
-    if running {
-      return Err("服务已在运行。".into());
+    let mut guard = state.lock().unwrap();
+    if guard.starting {
+      return Err("正在启动中，请稍候…".into());
     }
+    if let Some(child) = guard.child.as_mut() {
+      if child.try_wait().map(|s| s.is_none()).unwrap_or(false) {
+        return Err("服务已在运行。".into());
+      } else {
+        guard.child = None;
+      }
+    }
+    guard.starting = true;
   }
-  // 情况1：已有健康服务（外部手动启动 / 上次残留 / 另一实例启动），直接复用，不再起第二个。
-  if let Some(p) = probe_healthy_port() {
-    state.lock().unwrap().port = p;
-    let url = format!("http://{HOST}:{p}");
-    emit_log(&app, &format!("检测到已在运行的服务，直接复用 {url}"));
-    return Ok(url);
-  }
-  // 情况2：端口被占用但健康检查还没通过（外部正在启动中），等 2s 再探一次，避免双实例抢跑。
-  if any_port_open() {
-    tokio::time::sleep(Duration::from_millis(2000)).await;
-    if let Some(p) = probe_healthy_port() {
-      state.lock().unwrap().port = p;
-      let url = format!("http://{HOST}:{p}");
+  let done = |state: &State<'_, Mutex<LauncherState>>| {
+    state.lock().unwrap().starting = false;
+  };
+  // cxu 路径优先读缓存（后台已刷好，无子进程、无黑框）；缓存空才现找。
+  let path: String = {
+    let (cached, _) = cxu.inner.lock().unwrap().clone();
+    match cached {
+      Some(p) => p,
+      None => find_cxu().ok_or("未找到 cxu，请先安装。")?,
+    }
+  };
+  // 快路径：快照里已有健康服务（外部手动启动 / 上次残留），直接复用，立即返回。
+  {
+    let (running, _, port) = svc.inner.lock().unwrap().clone();
+    if running && health_ok(port) {
+      state.lock().unwrap().port = port;
+      done(&state);
+      let url = format!("http://{HOST}:{port}");
       emit_log(&app, &format!("检测到已在运行的服务，直接复用 {url}"));
       return Ok(url);
     }
@@ -344,50 +414,92 @@ async fn launcher_start(app: AppHandle, state: State<'_, Mutex<LauncherState>>) 
   emit_log(&app, &format!("启动 cxu: {path} serve --port {port}"));
   let _ = std::fs::create_dir_all(log_dir());
   let log_path = log_dir().join("cxu-serve.log");
-  let log_file = std::fs::File::create(&log_path).map_err(|e| e.to_string())?;
-  let err_file = log_file.try_clone().map_err(|e| e.to_string())?;
-  let mut cmd = silent_cmd(&path);
-  cmd.args(["serve", "--port", &port.to_string()]);
-  cmd.stdout(Stdio::from(log_file)).stderr(Stdio::from(err_file)).stdin(Stdio::null());
-  let child = cmd.spawn().map_err(|e| format!("启动失败: {e}"))?;
-  let _pid = child.id();
+  let log_file = std::fs::File::create(&log_path).map_err(|e| {
+    done(&state);
+    e.to_string()
+  })?;
+  let err_file = log_file.try_clone().map_err(|e| {
+    done(&state);
+    e.to_string()
+  })?;
+  let child = spawn_cxu_serve(&path, port, log_file, err_file).map_err(|e| {
+    done(&state);
+    format!("启动失败（spawn {path} 出错）: {e}，请看 cxu-serve.log。")
+  })?;
   state.lock().unwrap().child = Some(child);
-  for _ in 0..80 {
-    tokio::time::sleep(Duration::from_millis(250)).await;
+  // 等待就绪：每 500ms 探一次，共 20s；每 2s 打一行进度，前端轮询能看到活着。
+  for i in 0..40 {
+    tokio::time::sleep(Duration::from_millis(500)).await;
     let (alive, _) = child_alive(&state);
     if !alive {
+      done(&state);
       return Err("cxu 进程已退出，请看 cxu-serve.log。".into());
     }
     if health_ok(port) {
+      svc.inner.lock().unwrap().clone_from(&(true, child_alive_pid(&state), port));
+      state.lock().unwrap().port = port;
+      done(&state);
       let url = format!("http://{HOST}:{port}");
       emit_log(&app, &format!("服务就绪 {url}"));
       return Ok(url);
     }
+    if i % 4 == 3 {
+      emit_log(&app, &format!("等待服务就绪…（{}s）", (i + 1) / 2));
+    }
   }
+  done(&state);
   Err("服务启动超时（20s），请看 cxu-serve.log。".into())
 }
 
-#[tauri::command]
-fn launcher_stop(state: State<'_, Mutex<LauncherState>>) -> Result<(), String> {
+// 只读 pid，不收割 child（status 快照/日志用）。
+fn child_alive_pid(state: &Mutex<LauncherState>) -> Option<u32> {
   let mut guard = state.lock().unwrap();
-  if let Some(mut child) = guard.child.take() {
-    let _ = child.kill();
-    let _ = child.wait();
+  if let Some(child) = guard.child.as_mut() {
+    match child.try_wait() {
+      Ok(None) => return Some(child.id()),
+      _ => {
+        guard.child = None;
+      }
+    }
   }
+  None
+}
+
+#[tauri::command]
+fn launcher_stop(state: State<'_, Mutex<LauncherState>>, svc: State<'_, ServiceCache>) -> Result<(), String> {
+  let port = {
+    let mut guard = state.lock().unwrap();
+    if let Some(mut child) = guard.child.take() {
+      let _ = child.kill();
+      let _ = child.wait();
+    }
+    guard.starting = false;
+    guard.port
+  };
+  // 立即把快照置为停止，UI 秒变；监控线程 2s 内会复核（若有外部服务会重新置为运行）。
+  *svc.inner.lock().unwrap() = (false, None, port);
   Ok(())
 }
 
 #[tauri::command]
-async fn launcher_restart(app: AppHandle, state: State<'_, Mutex<LauncherState>>) -> Result<String, String> {
+async fn launcher_restart(
+  app: AppHandle,
+  state: State<'_, Mutex<LauncherState>>,
+  cxu: State<'_, CxuCache>,
+  svc: State<'_, ServiceCache>,
+) -> Result<String, String> {
   {
     let mut guard = state.lock().unwrap();
+    if guard.starting {
+      return Err("正在启动中，请稍候…".into());
+    }
     if let Some(mut child) = guard.child.take() {
       let _ = child.kill();
       let _ = child.wait();
     }
   }
   tokio::time::sleep(Duration::from_millis(500)).await;
-  launcher_start(app, state).await
+  launcher_start(app, state, cxu, svc).await
 }
 
 fn run_blocking(app: &AppHandle, program: &str, args: &[&str], label: &str) -> Result<(), String> {
@@ -423,10 +535,13 @@ async fn launcher_update(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command]
-fn launcher_open_ui(app: AppHandle, state: State<'_, Mutex<LauncherState>>) -> Result<(), String> {
-  // 点击即返回：只读上次已知端口（由轮询 + 启动时维护），绝不在点击路径上做全端口扫描；
+fn launcher_open_ui(app: AppHandle, svc: State<'_, ServiceCache>) -> Result<(), String> {
+  // 点击即返回：只读服务快照，绝不在点击路径上做端口扫描；
   // 浏览器拉起丢独立线程 fire-and-forget，任何情况下都不卡 IPC、不卡窗口。
-  let port = state.lock().unwrap().port;
+  let (running, _, port) = svc.inner.lock().unwrap().clone();
+  if !running {
+    return Err("服务未运行，请先点击“启动服务”。".into());
+  }
   let url = format!("http://{HOST}:{port}");
   emit_log(&app, &format!("正在系统浏览器打开工作台 {url}"));
   std::thread::spawn(move || {
@@ -511,10 +626,12 @@ fn main() {
   let state = Mutex::new(LauncherState::default());
   let latest = LatestCache::default();
   let cxu = CxuCache::default();
+  let svc = ServiceCache::default();
   tauri::Builder::default()
     .manage(state)
     .manage(latest)
     .manage(cxu)
+    .manage(svc)
     .plugin(tauri_plugin_opener::init())
     .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
       show_main(app);
@@ -557,8 +674,12 @@ fn main() {
         .on_menu_event(|app, event| match event.id.as_ref() {
           "open" => show_main(app),
           "open_ui" => {
-            let st: State<'_, Mutex<LauncherState>> = app.state();
-            let port = st.lock().unwrap().port;
+            let svc: State<'_, ServiceCache> = app.state();
+            let (running, _, port) = svc.inner.lock().unwrap().clone();
+            if !running {
+              try_append_log("打开工作台被忽略：服务未运行。");
+              return;
+            }
             let url = format!("http://{HOST}:{port}");
             try_append_log(&format!("正在系统浏览器打开工作台 {url}"));
             std::thread::spawn(move || {
@@ -571,15 +692,21 @@ fn main() {
             let h = app.clone();
             tauri::async_runtime::spawn(async move {
               let st: State<'_, Mutex<LauncherState>> = h.state();
+              let cxu: State<'_, CxuCache> = h.state();
+              let svc: State<'_, ServiceCache> = h.state();
               // stop then start
               {
                 let mut guard = st.lock().unwrap();
+                if guard.starting {
+                  try_append_log("重启被忽略：正在启动中。");
+                  return;
+                }
                 if let Some(mut child) = guard.child.take() {
                   let _ = child.kill();
                   let _ = child.wait();
                 }
               }
-              let _ = launcher_start(h.clone(), st).await;
+              let _ = launcher_start(h.clone(), st, cxu, svc).await;
             });
           }
           "quit" => {
@@ -601,13 +728,22 @@ fn main() {
           }
         })
         .build(app)?;
-      // 后台慢刷（独立 OS 线程，不能用 runtime 内 block_on，会 panic）：
-      // - cxu 定位/版本：启动立即刷一次，之后每 60s（装/卸 cxu 才变，不值得进 3s 热路径）。
+      // 后台线程（独立 OS 线程，不能用 runtime 内 block_on，会 panic）：
+      // - 服务快照：每 ~2s 刷一次（快路径 1 次 TCP；只有上次端口挂了才全量扫）。
+      //   所有 IPC 热路径只读快照，永不阻塞 —— 无服务时也不会卡死。
+      // - cxu 定位/版本：启动立即刷一次，之后每 60s。
       // - 远端版本：首次延迟 2s 让窗口先出来，之后每 600s；失败不清零（保留旧值）。
       {
         let h2 = handle.clone();
         std::thread::spawn(move || {
           refresh_cxu_cache(&h2);
+          // 启动即刷一次服务快照，窗口第一次 status 就有数，不用等。
+          {
+            let st: State<'_, Mutex<LauncherState>> = h2.state();
+            let svc: State<'_, ServiceCache> = h2.state();
+            let snap = current_service(&st);
+            *svc.inner.lock().unwrap() = snap;
+          }
           std::thread::sleep(Duration::from_millis(2000));
           let v = fetch_latest_blocking();
           if v.is_some() {
@@ -616,12 +752,18 @@ fn main() {
           }
           let mut tick: u64 = 0;
           loop {
-            std::thread::sleep(Duration::from_secs(30));
+            std::thread::sleep(Duration::from_secs(2));
+            {
+              let st: State<'_, Mutex<LauncherState>> = h2.state();
+              let svc: State<'_, ServiceCache> = h2.state();
+              let snap = current_service(&st);
+              *svc.inner.lock().unwrap() = snap;
+            }
             tick += 1;
-            if tick % 2 == 0 {
+            if tick % 30 == 0 {
               refresh_cxu_cache(&h2);
             }
-            if tick % 20 == 0 {
+            if tick % 300 == 0 {
               let v = fetch_latest_blocking();
               if v.is_some() {
                 let cache: State<'_, LatestCache> = h2.state();
@@ -631,15 +773,27 @@ fn main() {
           }
         });
       }
-      // auto-start server if cxu exists (best-effort, never blocks window)
+      // auto-start server if cxu exists and nothing running (best-effort, never blocks window).
+      // 只在“无任何服务”时起一次；有外部服务就复用（快照里已有），绝不重复拉起。
       let h = handle.clone();
       tauri::async_runtime::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(600)).await;
-        if find_cxu().is_none() {
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let cxu: State<'_, CxuCache> = h.state();
+        let svc: State<'_, ServiceCache> = h.state();
+        let st: State<'_, Mutex<LauncherState>> = h.state();
+        let has_cxu = cxu.inner.lock().unwrap().0.is_some() || find_cxu().is_some();
+        if !has_cxu {
           return;
         }
-        let st: State<'_, Mutex<LauncherState>> = h.state();
-        let _ = launcher_start(h.clone(), st).await;
+        let (running, _, _) = svc.inner.lock().unwrap().clone();
+        if running {
+          return;
+        }
+        // 快照可能还没刷好（启动 1.5s 内），快速确认一次，避免无服务时误判。
+        if probe_healthy_port().is_some() {
+          return;
+        }
+        let _ = launcher_start(h.clone(), st, cxu, svc).await;
       });
       Ok(())
     })
